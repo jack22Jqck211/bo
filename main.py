@@ -588,27 +588,31 @@ async def revoke_account(data: Dict[str, str]):
     return {"ok": True}
 
 # --- VLESS Core Inbounds Execution ---
+# --- VLESS Core Inbounds Execution ---
 @app.websocket("/vless-ws")
 async def handle_vless_ws(websocket: WebSocket):
     await websocket.accept()
-    # Read first VLESS packet layer from client to authenticate user UUID
     try:
-        # Tunnel routing execution blocks
         while True:
             msg = await websocket.receive_bytes()
-            # forward to core relay
     except WebSocketDisconnect:
         pass
 
 @app.post("/vless-xhttp")
 async def handle_vless_xhttp_up(request: Request):
-    # Streaming incoming XHTTP chunk reassembly loops
     return Response(status_code=202)
 
-@app.on_event("startup")
-async def startup_event():
+# مکانیزم مدرن مدیریت استارت‌آپ به جای on_event
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     add_log("سامانه گیت‌وی آئورا با موفقیت راه‌اندازی شد.")
     asyncio.create_task(metrics_worker())
+    yield
+
+# مقداردهی مجدد اپلیکیشن با لایف‌اسپن جدید
+app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
-    uvicorn.run("main.py:app", host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

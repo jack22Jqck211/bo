@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Optimize layer caching
 RUN pip install --no-cache-dir \
         "fastapi==0.111.0" \
         "uvicorn[standard]==0.30.1" \
@@ -10,7 +9,7 @@ RUN pip install --no-cache-dir \
 
 COPY main.py .
 
-# Dynamic binding via environment $PORT handled natively
 EXPOSE 8000
 
-CMD ["python", "main.py"]
+# تغییر این خط: به جای python main.py مستقیم با uvicorn یا پایتون استاندارد لود میکنیم
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
