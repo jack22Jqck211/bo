@@ -11,5 +11,4 @@ COPY main.py .
 
 EXPOSE 8000
 
-# تغییر این خط: به جای python main.py مستقیم با uvicorn یا پایتون استاندارد لود میکنیم
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

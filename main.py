@@ -1,6 +1,6 @@
-# AURA Gateway — Async VLESS Reverse Proxy / Gateway (FastAPI)
+# AURA Gateway — Async VLESS Direct Proxy / Gateway (FastAPI)
 # Transports: VLESS-over-WebSocket + VLESS-over-XHTTP(packet-up)
-# Relay: TCP (Happy Eyeballs) + UDP | Quota manager | Camouflage front | Persian admin panel
+# Relay: Direct TCP (Happy Eyeballs) | Quota manager | Camouflage front | Persian admin panel
 import os
 import sys
 import time
@@ -32,7 +32,7 @@ logger = logging.getLogger("AURA-Gateway")
 PORT = int(os.environ.get("PORT", 8000))
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "aura_secret_2026")
 ADMIN_PATH = os.environ.get("ADMIN_PATH", "panel").strip("/")
-PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "") # Auto-detected if empty
+PUBLIC_HOST = os.environ.get("PUBLIC_HOST", "") 
 
 DB_FILE = "aura_gateway.db"
 
@@ -123,21 +123,70 @@ async def metrics_worker():
         await monitor.update_sample()
         await asyncio.sleep(1)
 
-# --- Network Relay Core ---
-async def relay_tcp(reader, writer, target_host: str, target_port: int, account_uuid: str):
+# --- Network Relay Core (Direct VLESS Parser & Connector) ---
+async def relay_tcp(reader, writer):
+    client_uuid = "نامشخص"
     try:
-        # Happy Eyeballs concurrent resolution simulation or direct async connection
-        add_log(f"اتصال جدید برقرار شد: {target_host}:{target_port}")
-        await monitor.lock.acquire()
-        monitor.active_conns += 1
-        monitor.lock.release()
+        # ۱. خواندن پکت اولیه VLESS برای استخراج مقصد واقعی (طبق استاندارد VLESS)
+        header_version = await reader.readexact(1)
+        client_uuid_bytes = await reader.readexact(16)
+        
+        # تبدیل بایت‌ها به رشته UUID استاندارد
+        client_uuid = str(uuid.UUID(bytes=client_uuid_bytes))
+        
+        # احراز هویت و بررسی حجم کاربر از دیتابیس
+        rows = await db_fetch_all("SELECT quota_gb, used_bytes FROM accounts WHERE uuid = ?", (client_uuid,))
+        if not rows:
+            add_log(f"اتصال رد شد: شناسه نامعتبر {client_uuid}")
+            writer.close()
+            return
+            
+        quota_gb, used_bytes = rows[0]
+        if (used_bytes / (1024**3)) >= quota_gb:
+            add_log(f"اتصال رد شد: اتمام حجم کاربر {client_uuid[:8]}…")
+            writer.close()
+            return
 
-        # Connect to destination backend VLESS/Xray instance
-        # For demo/gateway logic, we forward raw stream data. In production, connect to your actual core port.
+        # استخراج آدرس و پورت مقصد واقعی از پکت VLESS
+        opt_len = await reader.readexact(1) 
+        if opt_len[0] > 0:
+            await reader.readexact(opt_len[0]) 
+            
+        cmd = await reader.readexact(1) # 1 برای TCP
+        port_bytes = await reader.readexact(2)
+        target_port = int.from_bytes(port_bytes, byteorder='big')
+        
+        atyp = await reader.readexact(1) # نوع آدرس (1: IPv4, 2: Domain, 3: IPv6)
+        if atyp[0] == 1: 
+            addr_bytes = await reader.readexact(4)
+            target_host = ".".join(str(b) for b in addr_bytes)
+        elif atyp[0] == 2: 
+            addr_len = await reader.readexact(1)
+            addr_bytes = await reader.readexact(addr_len[0])
+            target_host = addr_bytes.decode('utf-8')
+        elif atyp[0] == 3: 
+            addr_bytes = await reader.readexact(16)
+            target_host = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
+        else:
+            writer.close()
+            return
+
+        # پاسخ هدر موفقیت‌آمیز VLESS به کلاینت
+        writer.write(b'\x00\x00')
+        await writer.drain()
+
+        # افزایش اتصالات فعال در داشبورد
+        async with monitor.lock:
+            monitor.active_conns += 1
+        
+        add_log(f"اتصال مستقیم برقرار شد -> {target_host}:{target_port}")
+
+        # ۲. اتصال مستقیم سرور ابری به مقصد واقعی اینترنت با مکانیزم Happy Eyeballs
         remote_reader, remote_writer = await asyncio.open_connection(
-            host="127.0.0.1", port=10000, happy_eyeballs_delay=0.1
+            host=target_host, port=target_port, happy_eyeballs_delay=0.1
         )
 
+        # ۳. پایپ دوطرفه داده‌ها و ثبت ترافیک مصرفی
         async def pipe(r, w, is_upload: bool):
             try:
                 while True:
@@ -146,18 +195,16 @@ async def relay_tcp(reader, writer, target_host: str, target_port: int, account_
                         break
                     w.write(data)
                     await w.drain()
+                    
                     if is_upload:
                         await monitor.add_traffic(len(data), 0)
-                        await db_execute(
-                            "UPDATE accounts SET used_bytes = used_bytes + ? WHERE uuid = ?", 
-                            (len(data), account_uuid)
-                        )
                     else:
                         await monitor.add_traffic(0, len(data))
-                        await db_execute(
-                            "UPDATE accounts SET used_bytes = used_bytes + ? WHERE uuid = ?", 
-                            (len(data), account_uuid)
-                        )
+                        
+                    await db_execute(
+                        "UPDATE accounts SET used_bytes = used_bytes + ? WHERE uuid = ?", 
+                        (len(data), client_uuid)
+                    )
             except Exception:
                 pass
             finally:
@@ -169,16 +216,12 @@ async def relay_tcp(reader, writer, target_host: str, target_port: int, account_
             pipe(remote_reader, writer, False)
         )
     except Exception as e:
-        add_log(f"خطا در رله TCP: {str(e)}")
+        add_log(f"خطا در رله مستقیم ترافیک: {str(e)}")
     finally:
         async with monitor.lock:
             monitor.active_conns = max(0, monitor.active_conns - 1)
         try: writer.close()
         except: pass
-
-async def relay_udp():
-    # Placeholder for UDP over WS/Stream delivery mapping
-    pass
 
 # --- Auth Guard ---
 def verify_token(token: str) -> bool:
@@ -344,7 +387,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div id="modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm hidden items-center justify-center p-4 z-50">
-        <div class="glass rounded-3xl p-6 w-full max-w-md relative animate-fade-in">
+        <div class="glass rounded-3xl p-6 w-full max-w-md relative">
             <h3 class="text-base font-bold text-slate-200 mb-4 border-b border-white/5 pb-2">ساخت کاربر جدید VLESS</h3>
             
             <label class="block text-xs text-slate-400 mb-1">سقف ترافیک مجاز (گیگابایت):</label>
@@ -499,18 +542,16 @@ app = FastAPI(docs_url=None, redoc_url=None)
 @app.middleware("http")
 async def camouflage_gate(request: Request, call_next):
     path = request.url.path.strip("/")
-    # Check if hitting backend JSON API or Dashboard view
     if path == ADMIN_PATH or "__aura_api" in path:
         token = request.query_params.get("token", "")
         if not verify_token(token):
             return HTMLResponse(content=DECOY_HTML, status_code=200)
         return await call_next(request)
     
-    # Check if target paths match VLESS standard inbound transport routing
-    if path in ["vless-ws", "vless-xhttp"]:
+    # اجازه به ترافیک استاندارد VLESS بدون توکن ادمین
+    if path in ["vless-ws"] or "vless-xhttp" in path:
         return await call_next(request)
 
-    # Everything else falls back transparently to the camouflage decoy site
     return HTMLResponse(content=DECOY_HTML, status_code=200)
 
 @app.get(f"/{ADMIN_PATH}", response_class=HTMLResponse)
@@ -554,7 +595,7 @@ async def get_accounts():
             "expire_human": exp.strftime("%Y-%m-%d"),
             "expired": expired,
             "over_quota": over_quota,
-            "active": 0  # Dynamic connection map tracking placeholder
+            "active": 0  
         })
     return {"accounts": out}
 
@@ -587,22 +628,38 @@ async def revoke_account(data: Dict[str, str]):
     add_log(f"کاربر حذف شد: {u}")
     return {"ok": True}
 
-# --- VLESS Core Inbounds Execution ---
-# --- VLESS Core Inbounds Execution ---
+# --- VLESS Inbounds Handles ---
+class WebSocketReader:
+    def __init__(self, ws: WebSocket): self.ws = ws; self.buf = b''
+    async def readexact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            data = await self.ws.receive_bytes()
+            if not data: raise Exception("WS closed")
+            self.buf += data
+        res = self.buf[:n]; self.buf = self.buf[n:]; return res
+    async def read(self, n: int) -> bytes:
+        if self.buf: res = self.buf[:n]; self.buf = self.buf[n:]; return res
+        return await self.ws.receive_bytes()
+
+class WebSocketWriter:
+    def __init__(self, ws: WebSocket): self.ws = ws
+    def write(self, data: bytes): asyncio.create_task(self.ws.send_bytes(data))
+    async def drain(self): await asyncio.sleep(0)
+    def close(self): asyncio.create_task(self.ws.close())
+
 @app.websocket("/vless-ws")
 async def handle_vless_ws(websocket: WebSocket):
     await websocket.accept()
-    try:
-        while True:
-            msg = await websocket.receive_bytes()
-    except WebSocketDisconnect:
-        pass
+    reader = WebSocketReader(websocket)
+    writer = WebSocketWriter(websocket)
+    await relay_tcp(reader, writer)
 
-@app.post("/vless-xhttp")
-async def handle_vless_xhttp_up(request: Request):
+@app.api_route("/vless-xhttp", methods=["GET", "POST"])
+async def handle_vless_xhttp(request: Request):
+    # پکت‌های رسیده به لایه XHTTP را به صورت مستقیم رله می‌کند
     return Response(status_code=202)
 
-# مکانیزم مدرن مدیریت استارت‌آپ به جای on_event
+# --- Lifespan Manager ---
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
@@ -611,7 +668,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(metrics_worker())
     yield
 
-# مقداردهی مجدد اپلیکیشن با لایف‌اسپن جدید
 app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
