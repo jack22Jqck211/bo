@@ -207,9 +207,10 @@ async def relay_tcp(reader, writer):
         add_log(f"اتصال برقرار شد -> {target_host}:{target_port}")
 
         # اتصال به مقصد
+        # NOTE: happy_eyeballs_delay فقط در Python 3.12+ پشتیبانی میشه
         try:
             remote_reader, remote_writer = await asyncio.wait_for(
-                asyncio.open_connection(host=target_host, port=target_port, happy_eyeballs_delay=0.1),
+                asyncio.open_connection(host=target_host, port=target_port),
                 timeout=10.0
             )
         except asyncio.TimeoutError:
@@ -222,7 +223,26 @@ async def relay_tcp(reader, writer):
             return
 
         # Bidirectional pipe
-        async def pipe(r, w, is_upload: bool):
+        # remote_writer = asyncio.StreamWriter (write/drain استاندارد)
+        # writer = WebSocketWriter (write_bytes/drain)
+        # close فقط یه بار در finally اصلی انجام میشه
+        async def pipe_to_remote(r, w):
+            try:
+                while True:
+                    data = await r.read(16384)
+                    if not data:
+                        break
+                    w.write(data)
+                    await w.drain()
+                    await monitor.add_traffic(len(data), 0)
+                    await db_execute(
+                        "UPDATE accounts SET used_bytes = used_bytes + ? WHERE uuid = ?",
+                        (len(data), client_uuid)
+                    )
+            except Exception:
+                pass
+
+        async def pipe_to_client(r, w):
             try:
                 while True:
                     data = await r.read(16384)
@@ -230,35 +250,31 @@ async def relay_tcp(reader, writer):
                         break
                     await w.write_bytes(data)
                     await w.drain()
-                    if is_upload:
-                        await monitor.add_traffic(len(data), 0)
-                    else:
-                        await monitor.add_traffic(0, len(data))
+                    await monitor.add_traffic(0, len(data))
                     await db_execute(
                         "UPDATE accounts SET used_bytes = used_bytes + ? WHERE uuid = ?",
                         (len(data), client_uuid)
                     )
             except Exception:
                 pass
-            finally:
-                try:
-                    w.close()
-                except Exception:
-                    pass
 
         await asyncio.gather(
-            pipe(reader, remote_writer, True),
-            pipe(remote_reader, writer, False)
+            pipe_to_remote(reader, remote_writer),
+            pipe_to_client(remote_reader, writer)
         )
+
+        try:
+            remote_writer.close()
+            await remote_writer.wait_closed()
+        except Exception:
+            pass
+
     except Exception as e:
         add_log(f"خطا در رله ترافیک: {str(e)}")
     finally:
         async with monitor.lock:
             monitor.active_conns = max(0, monitor.active_conns - 1)
-        try:
-            writer.close()
-        except Exception:
-            pass
+        await writer.close_safe()
 
 # --- Auth Guard ---
 def verify_token(token: str) -> bool:
@@ -873,20 +889,39 @@ class WebSocketReader:
 class WebSocketWriter:
     def __init__(self, ws: WebSocket):
         self.ws = ws
+        self._closed = False
 
-    # BUG FIX: write باید async باشه و await بشه
     async def write_bytes(self, data: bytes):
-        await self.ws.send_bytes(data)
-
-    def write(self, data: bytes):
-        # برای سازگاری با pipe — ولی باید write_bytes استفاده بشه
-        asyncio.create_task(self.ws.send_bytes(data))
+        if self._closed:
+            return
+        try:
+            await self.ws.send_bytes(data)
+        except Exception:
+            self._closed = True
+            raise
 
     async def drain(self):
         await asyncio.sleep(0)
 
+    async def close_safe(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+    async def _close_ws(self):
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
     def close(self):
-        asyncio.create_task(self.ws.close())
+        if not self._closed:
+            self._closed = True
+            asyncio.create_task(self._close_ws())
 
 @app.websocket("/vless-ws")
 async def handle_vless_ws(websocket: WebSocket):
